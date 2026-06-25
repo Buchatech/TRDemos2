@@ -1,0 +1,110 @@
+name: Traceability Validation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  validate-traceability:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PB issue traceability
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: "all",
+              per_page: 100
+            });
+
+            const pbIssues = issues.filter((issue) => {
+              const isIssue = !Object.prototype.hasOwnProperty.call(issue, "pull_request");
+              return isIssue && /^PB-\d+:/i.test(issue.title || "");
+            });
+
+            const errors = [];
+
+            function extractIssueRefs(lineValue) {
+              const refs = [];
+              const regex = /#(\d+)/g;
+              let match;
+              while ((match = regex.exec(lineValue || "")) !== null) {
+                refs.push(Number(match[1]));
+              }
+              return refs;
+            }
+
+            for (const issue of pbIssues) {
+              const body = issue.body || "";
+              const issueRef = `#${issue.number} (${issue.title})`;
+
+              const hasAcceptanceCriteria =
+                /##\s*Acceptance Criteria/i.test(body) &&
+                /##\s*Acceptance Criteria[\s\S]*?-\s+/i.test(body);
+
+              const tcLineMatch = body.match(/Test Case Issue\(s\):\s*(.+)/i);
+              const evidenceLineMatch = body.match(/Evidence Link\(s\):\s*(.+)/i);
+              const statusLineMatch = body.match(/Status:\s*(.+)/i);
+
+              const tcRefs = tcLineMatch ? extractIssueRefs(tcLineMatch[1]) : [];
+              const evidenceRefs = evidenceLineMatch ? extractIssueRefs(evidenceLineMatch[1]) : [];
+
+              if (!hasAcceptanceCriteria) {
+                errors.push(`${issueRef} is missing acceptance criteria.`);
+              }
+
+              if (tcRefs.length === 0) {
+                errors.push(`${issueRef} does not have at least one linked test case issue.`);
+              }
+
+              if (evidenceRefs.length === 0) {
+                errors.push(`${issueRef} has no evidence reference.`);
+              }
+
+              const normalizedStatus = (statusLineMatch?.[1] || "").trim().toLowerCase();
+              const isDone = issue.state.toLowerCase() === "closed" || normalizedStatus === "done";
+
+              if (isDone) {
+                let hasValidatedEvidence = false;
+
+                for (const evidenceNumber of evidenceRefs) {
+                  try {
+                    const ev = await github.rest.issues.get({
+                      owner,
+                      repo,
+                      issue_number: evidenceNumber
+                    });
+                    const evBody = ev.data.body || "";
+                    const evState = (ev.data.state || "").toLowerCase();
+                    const evStatusMatch = evBody.match(/Evidence Status\s*\n\s*([^\n]+)/i);
+                    const evStatus = (evStatusMatch?.[1] || "").trim().toLowerCase();
+
+                    if (evState === "closed" || evStatus === "pass" || evStatus === "validated") {
+                      hasValidatedEvidence = true;
+                      break;
+                    }
+                  } catch (error) {
+                    errors.push(`${issueRef} references evidence #${evidenceNumber}, but it could not be read.`);
+                  }
+                }
+
+                if (!hasValidatedEvidence) {
+                  errors.push(`${issueRef} is marked Done/Closed without validated evidence.`);
+                }
+              }
+            }
+
+            if (errors.length > 0) {
+              core.setFailed(`Traceability validation failed:\n- ${errors.join("\n- ")}`);
+            } else {
+              core.info(`Traceability validation passed for ${pbIssues.length} PB issue(s).`);
+            }
